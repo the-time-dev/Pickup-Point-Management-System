@@ -6,6 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"github.com/gorilla/mux"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.uber.org/zap"
 	"io"
 	"log"
 	"net/http"
@@ -16,14 +19,71 @@ import (
 )
 
 type Server struct {
-	handler http.Handler
-	store   storage.Storage
-	auth    auth.Authorization
+	handler        http.Handler
+	metricsHandler http.Handler
+	store          storage.Storage
+	auth           auth.Authorization
+	logger         *zap.Logger
 }
 
-func NewServer(store storage.Storage, authorizator auth.Authorization) *Server {
-	router := mux.NewRouter()
-	server := &Server{handler: router, store: store, auth: authorizator}
+type metricsRouter struct {
+	*mux.Router
+	logger *zap.Logger
+}
+
+func newMetricsRouter(logger *zap.Logger) *metricsRouter {
+	return &metricsRouter{Router: mux.NewRouter(), logger: logger}
+}
+
+type logWriter struct {
+	http.ResponseWriter
+	code int
+}
+
+func (w *logWriter) WriteHeader(code int) {
+	w.code = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (s *metricsRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+
+	start := time.Now()
+
+	httpRequestsTotal.WithLabelValues(r.Method, r.URL.Path).Inc()
+
+	newW := &logWriter{ResponseWriter: w, code: http.StatusOK}
+
+	timer := prometheus.NewTimer(httpRequestDuration.WithLabelValues(r.Method, "/"))
+	defer timer.ObserveDuration()
+
+	s.Router.ServeHTTP(newW, r)
+
+	duration := time.Since(start)
+
+	if newW.code >= 200 && newW.code < 400 {
+		s.logger.Info("HTTP Request",
+			zap.String("method", r.Method),
+			zap.String("path", r.URL.Path),
+			zap.String("client_ip", r.RemoteAddr),
+			zap.Int("status", newW.code),
+			zap.Duration("duration", duration),
+		)
+	} else {
+		s.logger.Warn("HTTP Request",
+			zap.String("method", r.Method),
+			zap.String("path", r.URL.Path),
+			zap.String("client_ip", r.RemoteAddr),
+			zap.Int("status", newW.code),
+			zap.Duration("duration", duration),
+		)
+	}
+}
+
+func NewServer(store storage.Storage, authorizator auth.Authorization, logger *zap.Logger) *Server {
+	router := newMetricsRouter(logger)
+	metrics := newMetricsRouter(logger)
+
+	server := &Server{handler: router, metricsHandler: metrics, store: store, auth: authorizator, logger: logger}
 	router.HandleFunc("/ping", server.pingHandler).Methods("GET")
 	router.HandleFunc("/dummyLogin", server.dummyLoginHandler).Methods("POST")
 	router.HandleFunc("/register", server.registerHandler).Methods("POST")
@@ -35,7 +95,46 @@ func NewServer(store storage.Storage, authorizator auth.Authorization) *Server {
 	router.HandleFunc("/receptions", server.authHandler(server.receptionsHandler)).Methods("POST")
 	router.HandleFunc("/products", server.authHandler(server.productsHandler)).Methods("POST")
 
+	metrics.Handle("/metrics", promhttp.Handler())
+
 	return server
+}
+
+func (s *Server) ListenAndServe(programPort, metricsPort string) error {
+	programSrv := &http.Server{
+		Addr:    ":" + programPort,
+		Handler: s.handler,
+	}
+
+	metricsSrv := &http.Server{
+		Addr:    ":" + metricsPort,
+		Handler: s.metricsHandler,
+	}
+
+	errCh := make(chan error, 2)
+
+	go func() {
+		errCh <- programSrv.ListenAndServe()
+	}()
+
+	go func() {
+		errCh <- metricsSrv.ListenAndServe()
+	}()
+
+	err := <-errCh
+	go func() {
+		err := programSrv.Shutdown(context.Background())
+		if err != nil {
+			s.logger.Error("problem with closing program: " + err.Error())
+		}
+	}()
+	go func() {
+		err := metricsSrv.Shutdown(context.Background())
+		if err != nil {
+			s.logger.Error("problem with closing metrics: " + err.Error())
+		}
+	}()
+	return err
 }
 
 func (s *Server) authHandler(f func(w http.ResponseWriter, r *http.Request)) func(w http.ResponseWriter, r *http.Request) {
@@ -75,21 +174,15 @@ func (s *Server) pingHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) dummyLoginHandler(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(err.Error()))
-		return
-	}
-
 	type RequestData struct {
 		Role string `json:"role"`
 	}
 
 	qq := RequestData{}
 
-	err = json.Unmarshal(body, &qq)
+	err := s.getBody(r, &qq)
 	if err != nil {
+		s.logger.Error("failed to read request body", zap.Error(err))
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(err.Error()))
 		return
@@ -112,14 +205,16 @@ func (s *Server) dummyLoginHandler(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("\"" + generate + "\""))
 }
 
-func getBody(r *http.Request, RequestData any) error {
+func (s *Server) getBody(r *http.Request, RequestData any) error {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		s.logger.Error("failed to read request body", zap.Error(err))
 		return err
 	}
 
 	err = json.Unmarshal(body, RequestData)
 	if err != nil {
+		s.logger.Error("failed to read request body", zap.Error(err))
 		return err
 	}
 
@@ -135,7 +230,7 @@ func (s *Server) registerHandler(w http.ResponseWriter, r *http.Request) {
 
 	qq := RequestData{}
 
-	err := getBody(r, &qq)
+	err := s.getBody(r, &qq)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(err.Error()))
@@ -158,6 +253,7 @@ func (s *Server) registerHandler(w http.ResponseWriter, r *http.Request) {
 
 	user, err := s.store.CreateUser(qq.Email, qq.Password, []storage.Role{storage.Role(qq.Role)})
 	if err != nil {
+		s.logger.Error("failed to create user in storage", zap.Error(err))
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(err.Error()))
 		return
@@ -183,7 +279,7 @@ func (s *Server) loginHandler(w http.ResponseWriter, r *http.Request) {
 
 	qq := RequestData{}
 
-	err := getBody(r, &qq)
+	err := s.getBody(r, &qq)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(err.Error()))
@@ -223,15 +319,14 @@ func (s *Server) pvzPostHandler(w http.ResponseWriter, r *http.Request) {
 
 	qq := RequestData{}
 
-	err := getBody(r, &qq)
+	err := s.getBody(r, &qq)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(err.Error()))
 		return
 	}
 
-	if qq.Id == "" || qq.City == "" ||
-		(qq.City != "Москва" && qq.City != "Санкт-Петербург" && qq.City != "Казань") {
+	if qq.City != "Москва" && qq.City != "Санкт-Петербург" && qq.City != "Казань" {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte("\"invalid request. Some headers missed\""))
 		return
@@ -245,6 +340,7 @@ func (s *Server) pvzPostHandler(w http.ResponseWriter, r *http.Request) {
 		meow.PvzId = &qq.Id
 	}
 	if qq.City == "" {
+		s.logger.Error("failed to create pvz in storage", zap.Error(err))
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte("Please provide a valid city"))
 		return
@@ -253,6 +349,7 @@ func (s *Server) pvzPostHandler(w http.ResponseWriter, r *http.Request) {
 
 	pvz, err := s.store.CreatePvz(r.Context().Value("uuid").(string), meow)
 	if err != nil {
+
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = w.Write([]byte(err.Error()))
 		return
@@ -266,14 +363,18 @@ func (s *Server) pvzPostHandler(w http.ResponseWriter, r *http.Request) {
 
 	resp := ResponseData{Id: *pvz.PvzId, RegistrationDate: *pvz.RegistrationDate, City: string(pvz.City)}
 
+	pvzCreatedTotal.Inc()
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	err = json.NewEncoder(w).Encode(resp)
 	if err != nil {
+		s.logger.Error("failed to write response", zap.Error(err))
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte("response cannot be converted to json. Something went wrong"))
 		return
 	}
+
 }
 
 func (s *Server) pvzGetHandler(w http.ResponseWriter, r *http.Request) {
@@ -313,6 +414,7 @@ func (s *Server) pvzGetHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	err = json.NewEncoder(w).Encode(resp)
 	if err != nil {
+		s.logger.Error("failed to write response", zap.Error(err))
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(err.Error()))
 		return
@@ -351,7 +453,7 @@ func (s *Server) receptionsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	qq := RequestData{}
 
-	err := getBody(r, &qq)
+	err := s.getBody(r, &qq)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(err.Error()))
@@ -372,10 +474,14 @@ func (s *Server) receptionsHandler(w http.ResponseWriter, r *http.Request) {
 		status   string
 	}
 	resp := ResponseData{Id: reception.ReceptionId, DateTime: reception.DateTime, PvzId: reception.PvzId, status: "in_progress"}
+
+	receptionsTotal.Inc()
+
 	w.WriteHeader(http.StatusCreated)
 	w.Header().Set("Content-Type", "application/json")
 	err = json.NewEncoder(w).Encode(resp)
 	if err != nil {
+		s.logger.Error("failed to write response", zap.Error(err))
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(err.Error()))
 		return
@@ -420,10 +526,14 @@ func (s *Server) productsHandler(w http.ResponseWriter, r *http.Request) {
 		ReceptionId string    `json:"receptionId"`
 	}
 	resp := ResponseData{Id: product.ProductId, DateTime: product.DateTime, Type: product.ProductType, ReceptionId: product.ReceptionId}
+
+	productAddedTotal.Inc()
+
 	w.WriteHeader(http.StatusCreated)
 	w.Header().Set("Content-Type", "application/json")
 	err = json.NewEncoder(w).Encode(resp)
 	if err != nil {
+		s.logger.Error("failed to write response", zap.Error(err))
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(err.Error()))
 		return

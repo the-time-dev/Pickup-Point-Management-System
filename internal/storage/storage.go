@@ -12,6 +12,7 @@ type Storage interface {
 	OpenReception(author string, pvz string) (*ReceptionInfo, error)
 	AddProduct(uuid, author, product string) (*Product, error)
 	DeleteLastProduct(uuid string) error
+	GetOnlyPvzList() ([]PvzInfo, error)
 }
 
 type LoginFailed struct{ Message string }

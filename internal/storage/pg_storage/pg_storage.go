@@ -493,3 +493,26 @@ func (s *PgStorage) DeleteLastProduct(uuid string) error {
 	}
 	return nil
 }
+
+func (s *PgStorage) GetOnlyPvzList() ([]storage.PvzInfo, error) {
+	query := fmt.Sprintf("SELECT * FROM pvz")
+
+	row, err := s.conn.Query(context.Background(), query)
+	if err != nil {
+		return nil, err
+	}
+
+	var res []storage.PvzInfo
+
+	for row.Next() {
+		v, err := row.Values()
+		if err != nil {
+			return nil, err
+		}
+		id := parseStringFromUUID(v[0].([16]byte))
+		t := v[3].(time.Time)
+		res = append(res, storage.PvzInfo{PvzId: &id, RegistrationDate: &t, City: storage.City(v[2].(string))})
+	}
+
+	return res, nil
+}

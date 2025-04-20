@@ -30,7 +30,6 @@ CREATE SCHEMA public;
 	}
 }
 
-// setupStorage должен возвращать инициализированный экземпляр Storage
 func setupStorage(t *testing.T) storage.Storage {
 	pgConn, ok := os.LookupEnv("PG_CONN")
 	if !ok {
@@ -46,7 +45,7 @@ func setupStorage(t *testing.T) storage.Storage {
 		log.Fatal(err)
 	}
 
-	return pg // Замените на реальную реализацию
+	return pg
 }
 
 func teardownStorage(t *testing.T, s storage.Storage) {
@@ -177,7 +176,6 @@ func TestReceptionFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Создание ПВЗ
 	pvz, err := s.CreatePvz(user.UserId, storage.PvzInfo{City: storage.SPB})
 	if err != nil {
 		t.Fatal(err)
@@ -189,7 +187,6 @@ func TestReceptionFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Открытие рецепции
 	reception, err := s.OpenReception(user.UserId, pvzID)
 	if err != nil {
 		t.Fatal(err)
@@ -201,7 +198,6 @@ func TestReceptionFlow(t *testing.T) {
 		}
 	})
 
-	// Добавление продукта
 	product, err := s.AddProduct(*pvz.PvzId, user.UserId, "одежда")
 	if err != nil {
 		t.Fatal(err)
@@ -213,7 +209,6 @@ func TestReceptionFlow(t *testing.T) {
 		}
 	})
 
-	// Закрытие рецепции
 	closed, err := s.CloseLastReception(pvzID)
 	if err != nil {
 		t.Fatal(err)
@@ -225,7 +220,6 @@ func TestReceptionFlow(t *testing.T) {
 		}
 	})
 
-	// Открытие рецепции
 	_, err = s.OpenReception(user.UserId, pvzID)
 	if err != nil {
 		t.Fatal(err)
@@ -235,14 +229,12 @@ func TestReceptionFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Удаление продукта
 	t.Run("delete product", func(t *testing.T) {
 		err := s.DeleteLastProduct(*pvz.PvzId)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		// Проверка удаления
 		pvzs, _ := s.GetPvzInfo("", "", 1, 10)
 		for _, p := range pvzs {
 			if *p.PvzId == pvzID {
