@@ -43,6 +43,18 @@ func main() {
 		logger.Warn("PORT not set, using default :8080")
 	}
 
+	metrics_port, ok := os.LookupEnv("METRICS_PORT")
+	if !ok {
+		metrics_port = "9000"
+		logger.Warn("METRICS_PORT not set, using default :9000")
+	}
+
+	grpc_port, ok := os.LookupEnv("GRPC_PORT")
+	if !ok {
+		metrics_port = "3000"
+		logger.Warn("GRPC_PORT not set, using default :9000")
+	}
+
 	pg, err := pg_storage.NewPgStorage(pgConn)
 	if err != nil {
 		logger.Fatal("failed to connect to Postgres", zap.Error(err))
@@ -56,12 +68,12 @@ func main() {
 	auth := jwt_auth.NewJwtAuth(jwtKey)
 	h := http_api.NewServer(pg, auth, logger)
 
-	lis, err := net.Listen("tcp", ":50051")
+	lis, err := net.Listen("tcp", ":"+grpc_port)
 	if err != nil {
 		logger.Fatal("failed to listen on gRPC port", zap.Error(err))
 	}
 
-	logger.Info("starting gRPC server on :50051")
+	logger.Info("starting gRPC server", zap.String("grpc-port", grpc_port))
 	s := grpc.NewServer()
 	pb.RegisterPVZServiceServer(s, grpc_api.NewGrpcServer(pg, logger))
 
@@ -71,8 +83,8 @@ func main() {
 		}
 	}()
 
-	logger.Info("starting HTTP server", zap.String("port", port), zap.String("grpc-port", "50051"))
-	if err := h.ListenAndServe(port, "9000"); err != nil {
+	logger.Info("starting HTTP server", zap.String("port", port), zap.String("metrics-port", metrics_port))
+	if err := h.ListenAndServe(port, metrics_port); err != nil {
 		logger.Fatal("HTTP server failed", zap.Error(err))
 	}
 }

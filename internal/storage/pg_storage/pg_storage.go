@@ -24,7 +24,8 @@ type PgStorage struct {
 }
 
 func NewPgStorage(connString string) (*PgStorage, error) {
-	conn, err := pgx.Connect(context.Background(), connString)
+	con, _ := context.WithTimeout(context.Background(), time.Second*5)
+	conn, err := pgx.Connect(con, connString)
 	if err != nil {
 		return nil, err
 	}
